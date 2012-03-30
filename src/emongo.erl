@@ -446,8 +446,8 @@ initialize_pools() ->
 					size = proplists:get_value(size, Props, 1),
 					host = proplists:get_value(host, Props, "localhost"), 
 					port = proplists:get_value(port, Props, 27017), 
-					user = proplists:get_value(user, Props, "user"), 
-					pass = proplists:get_value(pass, Props, "pass"), 
+					user = proplists:get_value(user, Props), 
+					pass = proplists:get_value(pass, Props), 
 					database = proplists:get_value(database, Props, "test")
 				},
 				{PoolId, do_open_connections(Pool)}
@@ -461,16 +461,14 @@ do_open_connections(#pool{user=User, pass=Pass, conn_pids=Pids, size=Size}=Pool)
                 {error, Reason} ->
                     {error, Reason};
                 Pid ->
-                    case User of
-                        undefined ->
-                            ok;
-                        _ ->
+                    if User =/= undefined andalso Pass =/= undefined ->
                             case getnonce(Pid, Pool) of
                                 error ->
                                     throw(getnonce);
                                 Nonce ->
                                     do_auth(Nonce, Pid, Pool, User, Pass)
-                            end
+                            end;
+                        true -> ok
                     end,
                     do_open_connections(Pool#pool{conn_pids = queue:in(Pid, Pids)})
             end;
