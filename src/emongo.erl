@@ -307,10 +307,25 @@ count(PoolId, Collection) ->
 %%--------------------------------------------------------------------
 init(_) ->
 	process_flag(trap_exit, true),
-	Pools = initialize_pools(),
+	case application:get_env(emongo, pools) of
+		undefined -> [];
+		{ok, Pools} ->
+            lists:foreach(fun({PoolId, Props}) ->
+                        Pool = #pool{
+                            id = PoolId, 
+                            size = proplists:get_value(size, Props, 1),
+                            host = proplists:get_value(host, Props, "localhost"), 
+                            port = proplists:get_value(port, Props, 27017), 
+                            user = proplists:get_value(user, Props), 
+                            pass = proplists:get_value(pass, Props), 
+                            database = proplists:get_value(database, Props, "test")
+                        },
+                        erlang:send(self(), {repeated_connect, PoolId, Pool})
+                end, Pools)
+	end,
 	{ok, HN} = inet:gethostname(),
 	<<HashedHN:3/binary,_/binary>> = erlang:md5(HN),
-	{ok, #state{pools=Pools, oid_index=1, hashed_hostn=HashedHN}}.
+    {ok, #state{pools=[], oid_index=1, hashed_hostn=HashedHN}}.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -336,8 +351,8 @@ handle_call({add_pool, PoolId, Host, Port, Database, Size}, _From, #state{pools=
 		case proplists:is_defined(PoolId, Pools) of
 			true ->
                 Pool = proplists:get_value(PoolId, Pools),
-                Pool1 = do_open_connections(Pool),
-                {ok, [{PoolId, Pool1}|proplists:delete(PoolId, Pools)]};
+                erlang:send(self(), {repeated_connect, PoolId, Pool}),
+                {ok, proplists:delete(PoolId, Pools)};
 			false ->
 				Pool = #pool{
 					id=PoolId,
@@ -346,8 +361,8 @@ handle_call({add_pool, PoolId, Host, Port, Database, Size}, _From, #state{pools=
 					database=Database,
 					size=Size
 				},
-				Pool1 = do_open_connections(Pool),
-				{ok, [{PoolId, Pool1}|Pools]}
+                erlang:send(self(), {repeated_connect, PoolId, Pool}),
+				{ok, Pools}
 		end,
 	{reply, Result, State#state{pools=Pools1}};
 	
@@ -402,15 +417,21 @@ handle_info({'EXIT', Pid, {PoolId, tcp_closed}}, #state{pools=Pools}=State) ->
 			{Pool, Others} ->
 				Pids1 = queue:filter(fun(Item) -> Item =/= Pid end, Pool#pool.conn_pids),
 				Pool1 = Pool#pool{conn_pids = Pids1},
-                case do_open_connections(Pool1) of
-                    {error, _Reason} ->
-                        Pools1 = Others;
-                    Pool2 ->
-                        Pools1 = [{PoolId, Pool2}|Others]
-                end,
-				State#state{pools=Pools1}
+                erlang:send(self(), {repeated_connect, PoolId, Pool1}),
+				State#state{pools=Others}
 		end,
 	{noreply, State1};
+
+handle_info({repeated_connect, PoolId, Pool0}, #state{pools=Pools0}=State) ->
+    State1 = case do_open_connections(Pool0) of
+        {error, _Reason} ->
+            erlang:send_after(1000, self(), {repeated_connect, PoolId, Pool0}),
+            State;
+        Pool ->
+            Pools = [{PoolId, Pool}|Pools0],
+            State#state{pools=Pools}
+    end,
+    {noreply, State1};
 	
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -432,28 +453,6 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-%%--------------------------------------------------------------------
-%%% Internal functions
-%%--------------------------------------------------------------------
-initialize_pools() ->
-	case application:get_env(emongo, pools) of
-		undefined ->
-			[];
-		{ok, Pools} ->
-			[begin
-				Pool = #pool{
-					id = PoolId, 
-					size = proplists:get_value(size, Props, 1),
-					host = proplists:get_value(host, Props, "localhost"), 
-					port = proplists:get_value(port, Props, 27017), 
-					user = proplists:get_value(user, Props), 
-					pass = proplists:get_value(pass, Props), 
-					database = proplists:get_value(database, Props, "test")
-				},
-				{PoolId, do_open_connections(Pool)}
-			 end || {PoolId, Props} <- Pools]
-	end.
-		
 do_open_connections(#pool{user=User, pass=Pass, conn_pids=Pids, size=Size}=Pool) -> 
 	case queue:len(Pids) < Size of
 		true ->
@@ -468,7 +467,8 @@ do_open_connections(#pool{user=User, pass=Pass, conn_pids=Pids, size=Size}=Pool)
                                 Nonce ->
                                     do_auth(Nonce, Pid, Pool, User, Pass)
                             end;
-                        true -> ok
+                        true ->
+                            ok
                     end,
                     do_open_connections(Pool#pool{conn_pids = queue:in(Pid, Pids)})
             end;
@@ -529,7 +529,7 @@ create_query([{offset, Offset}|Options], QueryRec, QueryDoc, OptDoc) ->
 	create_query(Options, QueryRec1, QueryDoc, OptDoc);
 
 create_query([{orderby, Orderby}|Options], QueryRec, QueryDoc, OptDoc) ->
-	Orderby1 = [{Key, case Dir of desc -> -1; _ -> 1 end}|| {Key, Dir} <- Orderby],
+	Orderby1 = [{Key, case Dir of desc -> -1; _ -> 1 end} || {Key, Dir} <- Orderby],
 	OptDoc1 = [{<<"orderby">>, Orderby1}|OptDoc],
 	create_query(Options, QueryRec, QueryDoc, OptDoc1);
 	
